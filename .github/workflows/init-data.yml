@@ -1,0 +1,92 @@
+name: 数据初始化（首次/每周刷新）
+
+on:
+  # 每周日 UTC 02:00 = 北京时间 10:00，自动刷新板块成分股和基本面
+  schedule:
+    - cron: '0 2 * * 0'
+  # 手动触发（首次必须手动运行一次）
+  workflow_dispatch:
+
+concurrency:
+  group: data-init
+  cancel-in-progress: false
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120     # 初始化较慢，留足时间
+    permissions:
+      contents: write        # 需要写权限推 data 分支
+
+    steps:
+      - name: 检出代码（main 分支）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: pip install akshare pandas --quiet
+
+      - name: 恢复已有数据缓存（增量模式）
+        run: |
+          git fetch origin data --depth=1 2>/dev/null || true
+          if git ls-remote --exit-code origin data &>/dev/null; then
+            git checkout origin/data -- data/ 2>/dev/null || true
+            echo "✅ 已从 data 分支恢复历史缓存"
+          else
+            echo "ℹ️  data 分支不存在，将全量初始化"
+          fi
+          mkdir -p data/history data/fundamentals
+
+      - name: 执行数据初始化
+        run: |
+          echo "开始时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          python init_data.py
+          echo "完成时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+
+      - name: 提交更新到 data 分支
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 将 data/ 目录内容保存到临时位置
+          cp -r data/ /tmp/stock-data/
+
+          # 切换到 data 分支（不存在则创建孤立分支）
+          if git ls-remote --exit-code origin data &>/dev/null; then
+            git fetch origin data
+            git checkout -B _data origin/data
+          else
+            git checkout --orphan _data
+            git rm -rf . --quiet 2>/dev/null || true
+          fi
+
+          # 还原数据文件
+          mkdir -p data/history data/fundamentals
+          cp -r /tmp/stock-data/* data/ 2>/dev/null || true
+
+          git add data/
+          if ! git diff --cached --quiet; then
+            git commit -m "init: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')"
+            git push origin _data:data --force
+            echo "✅ 数据已推送到 data 分支"
+          else
+            echo "ℹ️  数据无变化，跳过提交"
+          fi
+
+      - name: 上传初始化日志
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: init-log-${{ github.run_number }}
+          path: |
+            data/sector_stocks.csv
+            data/reference_lows.csv
+          retention-days: 7

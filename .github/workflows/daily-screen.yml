@@ -1,0 +1,173 @@
+name: 板块龙头每日追踪
+
+on:
+  schedule:
+    # 每个工作日 18:30 北京时间（UTC 10:30）
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      force_dsa:
+        description: '强制运行 DSA 分析（即使无信号）'
+        default: false
+        type: boolean
+
+concurrency:
+  group: daily-screen
+  cancel-in-progress: false
+
+jobs:
+  screen-and-analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      # ── 准备 ──────────────────────────────────────────────
+      - name: 检出代码（main 分支）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 恢复数据缓存 ──────────────────────────────────────
+      - name: 从 data 分支恢复数据缓存
+        run: |
+          git fetch origin data --depth=1 2>/dev/null || true
+          if git ls-remote --exit-code origin data &>/dev/null; then
+            git checkout origin/data -- data/ 2>/dev/null || true
+            echo "✅ 数据缓存恢复成功"
+            echo "  板块股票: $(wc -l < data/sector_stocks.csv 2>/dev/null || echo 0) 条"
+            echo "  历史K线: $(ls data/history/ 2>/dev/null | wc -l) 只"
+          else
+            echo "❌ data 分支不存在！请先手动运行「数据初始化」工作流"
+            exit 1
+          fi
+          mkdir -p data/history data/fundamentals logs reports
+
+      # ── 筛选 ──────────────────────────────────────────────
+      - name: 安装筛选依赖
+        run: pip install akshare pandas requests --quiet
+
+      - name: 执行每日板块筛选
+        run: |
+          echo "筛选开始: $(TZ='Asia/Shanghai' date '+%H:%M:%S')"
+          python daily_screen.py
+          echo "筛选完成: $(TZ='Asia/Shanghai' date '+%H:%M:%S')"
+          echo ""
+          echo "=== 待分析股票 ==="
+          cat screened_stocks.txt || echo "(无)"
+
+      # ── 固定推送日报汇总 ──────────────────────────────────
+      - name: 推送每日汇总报告
+        env:
+          FEISHU_WEBHOOK_URL:  ${{ secrets.FEISHU_WEBHOOK_URL }}
+          WECHAT_WEBHOOK_URL:  ${{ secrets.WECHAT_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python send_summary.py
+
+      # ── DSA 深度分析 ──────────────────────────────────────
+      - name: 安装 DSA 依赖
+        run: pip install -r requirements.txt --quiet
+
+      - name: DSA 深度分析（有信号时）
+        env:
+          # AI 模型（至少配置一个）
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS:      ${{ secrets.GEMINI_API_KEYS }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL:      ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL:         ${{ secrets.OPENAI_MODEL }}
+          DEEPSEEK_API_KEY:     ${{ secrets.DEEPSEEK_API_KEY }}
+          AIHUBMIX_KEY:         ${{ secrets.AIHUBMIX_KEY }}
+          ANSPIRE_API_KEYS:     ${{ secrets.ANSPIRE_API_KEYS }}
+          # 数据源
+          TUSHARE_TOKEN:        ${{ secrets.TUSHARE_TOKEN }}
+          # 新闻搜索（增强催化剂分析）
+          SERPAPI_API_KEYS:     ${{ secrets.SERPAPI_API_KEYS }}
+          TAVILY_API_KEYS:      ${{ secrets.TAVILY_API_KEYS }}
+          BOCHA_API_KEYS:       ${{ secrets.BOCHA_API_KEYS }}
+          BRAVE_API_KEYS:       ${{ secrets.BRAVE_API_KEYS }}
+          # 通知渠道（与汇总推送共用）
+          FEISHU_WEBHOOK_URL:   ${{ secrets.FEISHU_WEBHOOK_URL }}
+          WECHAT_WEBHOOK_URL:   ${{ secrets.WECHAT_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMAIL_SENDER:         ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:       ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS:      ${{ secrets.EMAIL_RECEIVERS }}
+          # 运行配置
+          LOG_LEVEL: INFO
+          MAX_WORKERS: '2'
+          TRADING_DAY_CHECK_ENABLED: 'false'   # 筛选已确认有信号，跳过交易日检查
+          MARKET_REVIEW_ENABLED: 'false'        # 不做大盘复盘，专注个股
+          SINGLE_STOCK_NOTIFY: 'true'           # 每只股票分析完立即推送
+        run: |
+          SCREENED=$(cat screened_stocks.txt 2>/dev/null || echo "")
+          FORCE="${{ github.event.inputs.force_dsa }}"
+
+          if [ -z "$SCREENED" ] && [ "$FORCE" != "true" ]; then
+            echo "今日无筛选信号，跳过 DSA 分析"
+            exit 0
+          fi
+
+          if [ -z "$SCREENED" ]; then
+            echo "强制模式：使用上次结果或跳过"
+            exit 0
+          fi
+
+          echo "================================================"
+          echo "  DSA 深度分析"
+          echo "================================================"
+          echo "分析股票: $SCREENED"
+          echo "开始时间: $(TZ='Asia/Shanghai' date '+%H:%M:%S')"
+
+          # 直接传入 STOCK_LIST，跳过 Secrets 中的 STOCK_LIST 配置
+          STOCK_LIST="$SCREENED" python main.py --no-market-review
+
+          echo "完成时间: $(TZ='Asia/Shanghai' date '+%H:%M:%S')"
+
+      # ── 更新数据缓存 ──────────────────────────────────────
+      - name: 提交今日数据更新到 data 分支
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          cp -r data/ /tmp/stock-data/
+
+          git fetch origin data
+          git checkout -B _data origin/data
+
+          mkdir -p data/history data/fundamentals
+          cp -r /tmp/stock-data/* data/ 2>/dev/null || true
+
+          git add data/
+          if ! git diff --cached --quiet; then
+            git commit -m "daily: $(TZ='Asia/Shanghai' date '+%Y-%m-%d')"
+            git push origin _data:data --force
+            echo "✅ 今日数据已更新到 data 分支"
+          else
+            echo "ℹ️  数据无变化"
+          fi
+
+      # ── 上传 ──────────────────────────────────────────────
+      - name: 上传今日产物
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daily-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            screening_results.json
+            screened_stocks.txt
+            reports/
+            logs/
+          retention-days: 14
